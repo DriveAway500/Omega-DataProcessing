@@ -17,6 +17,17 @@ BATCH_SIZE = 20_000  # linhas por executemany, evita picos de memória
 # nvdcve-2.0-recent.json.gz) caem no grupo "misc".
 YEAR_RE = re.compile(r"nvdcve-2\.0-(\d{4})\.json\.gz$")
 
+# Faixas de severidade usadas nas pesquisas (mesmas do SelectOption do bot)
+SEVERITY_RANGES = {
+    "low": (0.1, 3.9),
+    "medium": (4.0, 6.9),
+    "high": (7.0, 8.9),
+    "critical": (9.0, 10.0),
+}
+
+# Ordem de preferência das métricas CVSS: v3.1 > v3.0 > v2
+CVSS_METRIC_KEYS = ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2")
+
 
 def extract_year(file_path):
     m = YEAR_RE.search(os.path.basename(file_path))
@@ -25,6 +36,30 @@ def extract_year(file_path):
 
 def db_path_for_year(year):
     return os.path.join(DB_DIR, DB_NAME_TEMPLATE.format(year=year))
+
+
+def extract_cvss_score(cve):
+    """
+    Retorna o baseScore (float) da métrica CVSS mais recente disponível
+    no item da CVE, ou None se não houver nenhuma métrica.
+    Prioriza a entrada marcada como "Primary" quando há mais de uma fonte
+    (ex: NVD e um CNA) para a mesma versão de CVSS.
+    """
+    metrics = cve.get("metrics", {})
+    for key in CVSS_METRIC_KEYS:
+        entries = metrics.get(key)
+        if not entries:
+            continue
+        primary = next(
+            (e for e in entries if e.get("type") == "Primary"), entries[0]
+        )
+        score = primary.get("cvssData", {}).get("baseScore")
+        if score is not None:
+            try:
+                return float(score)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def connect_db(db_path):
@@ -48,7 +83,8 @@ def create_schema(conn):
         CREATE TABLE IF NOT EXISTS recent_cve (
             cve_id TEXT PRIMARY KEY,
             last_modified TEXT,
-            data TEXT
+            data TEXT,
+            cvss_score REAL
         )
         """
     )
@@ -66,18 +102,25 @@ def parse_file(file_path):
         cve_id = cve.get("id")
         last_modified = cve.get("lastModified")
         if cve_id and last_modified:
+            cvss_score = extract_cvss_score(cve)
             records.append(
-                (cve_id, last_modified, json.dumps(cve, separators=(",", ":")))
+                (
+                    cve_id,
+                    last_modified,
+                    json.dumps(cve, separators=(",", ":")),
+                    cvss_score,
+                )
             )
     return records
 
 
 UPSERT_SQL = """
-    INSERT INTO recent_cve (cve_id, last_modified, data)
-    VALUES (?, ?, ?)
+    INSERT INTO recent_cve (cve_id, last_modified, data, cvss_score)
+    VALUES (?, ?, ?, ?)
     ON CONFLICT(cve_id) DO UPDATE SET
         last_modified = excluded.last_modified,
-        data = excluded.data
+        data = excluded.data,
+        cvss_score = excluded.cvss_score
     WHERE excluded.last_modified > recent_cve.last_modified
 """
 
@@ -92,13 +135,21 @@ def load_data(conn, records):
 
 
 def finalize_db(conn):
-    """Cria índice + FTS5 e popula tudo em bloco (não linha a linha)."""
+    """Cria índices + FTS5 e popula tudo em bloco (não linha a linha)."""
     cur = conn.cursor()
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_recent_cve_last_modified
         ON recent_cve(last_modified DESC)
+        """
+    )
+
+    # Índice para busca rápida por faixa de CVSS (severidade)
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_recent_cve_cvss_score
+        ON recent_cve(cvss_score)
         """
     )
 
@@ -193,6 +244,39 @@ def process_files(file_pattern=FILE_PATTERN, workers=None):
 
     print(f"{total} registros carregados em {len(files)} bancos, "
           f"tempo total: {time.time() - t0:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Exemplo de consulta por severidade, pronto para reaproveitar no bot Discord
+# ---------------------------------------------------------------------------
+
+def query_by_severity(db_path, severity, limit=50, offset=0):
+    """
+    Busca CVEs cujo cvss_score cai na faixa da severidade escolhida.
+    `severity` deve ser um dos valores usados no SelectOption do bot:
+    "low", "medium", "high" ou "critical".
+    """
+    if severity not in SEVERITY_RANGES:
+        raise ValueError(f"Severidade inválida: {severity!r}")
+
+    min_score, max_score = SEVERITY_RANGES[severity]
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            """
+            SELECT cve_id, last_modified, cvss_score, data
+            FROM recent_cve
+            WHERE cvss_score BETWEEN ? AND ?
+            ORDER BY cvss_score DESC, last_modified DESC
+            LIMIT ? OFFSET ?
+            """,
+            (min_score, max_score, limit, offset),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
